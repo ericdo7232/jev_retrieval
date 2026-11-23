@@ -32,8 +32,12 @@ describe:
   model: Qwen/Qwen3-8B
   backend: vllm                   # vllm, or transformers (slower fallback, used automatically if vllm fails)
   max_new_tokens: 80
-  max_words: 30
+  max_words: 30                   # hard cap; longer outputs are first shortened by the model (shorten_prompt), then cut
   prompt: |-
-    Below are titles of Wikipedia pages that belong to one group, most typical first. Write one sentence of at most 30 words describing the main kinds of subjects in this group, including less typical ones. Output only the sentence.
+    Below are the titles of Wikipedia pages in one group, most typical first. Write one sentence of at most 25 words naming the kinds of subjects in the group. Cover the whole list, including kinds that only appear further down, not just the first titles. Name kinds of subjects rather than individual titles, and do not use the words "typical" or "less typical". Output only the sentence.
 
     {titles}
+  shorten_prompt: |-
+    Shorten this description of a group of Wikipedia pages to one complete sentence of at most 25 words, keeping the kinds of subjects it names. Output only the sentence.
+
+    {description}

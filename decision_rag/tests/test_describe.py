@@ -27,11 +27,17 @@ class FakeTokenizer:
 
 
 def fake_generate(texts):
-    """Answers with the first title listed in the prompt, so each description can be traced to its cluster."""
+    """Description prompts: answers with the first title listed, so each description can be traced to its cluster,
+    padded past the word limit when that title's number is even. Shorten prompts: keeps the first 4 words."""
     out = []
     for t in texts:
-        titles = t.split("<assistant>")[0].split("\n\n", 1)[1].splitlines()
-        out.append(f"<think>\n\n</think>\n\nGroup led by {titles[0]}.")
+        body = t.split("<assistant>")[0].split("\n\n", 1)[1]
+        if t.startswith("<user>Shorten"):
+            out.append(" ".join(body.split()[:4]))
+            continue
+        first = body.splitlines()[0]
+        pad = " and more" * 20 if int(first[1:]) % 2 == 0 else ""
+        out.append(f"<think>\n\n</think>\n\nGroup led by {first}.{pad}")
     return out
 
 
@@ -62,5 +68,8 @@ def test_describe_trees_writes_consistent_tree(drag_dir, cfg):
             assert c["size"] == len(c["pages"])
             assert set(c["pages"]) == set(clusters[clusters["cluster"] == c["id"]]["page_idx"])
             assert c["description"] == f"Group led by {titles[c['id']][0]}."  # matched to the right cluster
-        lines = (tree_dir(seed) / "descriptions.jsonl").read_text().splitlines()
-        assert [json.loads(l)["cluster"] for l in lines] == [0, 1, 2]
+        rows = [json.loads(l) for l in (tree_dir(seed) / "descriptions.jsonl").read_text().splitlines()]
+        assert [r["cluster"] for r in rows] == [0, 1, 2]
+        for r in rows:                                                     # long ones shortened, none cut
+            even = int(titles[r["cluster"]][0][1:]) % 2 == 0
+            assert (r["shortened"] is not None) == even and not r["truncated"]

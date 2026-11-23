@@ -23,7 +23,7 @@ Because the decision model differs from the paper's, results are not expected to
 
 - Each page is represented by its title and first sentence, embedded with **e5-base-v2**.
 - **k-means into 1,000 clusters**, holding 15–350 pages each (median 106).
-- Each cluster gets a one-sentence description of at most 30 words from **Qwen3-8B**. The description is written from up to 300 of the cluster's page titles, most typical first, and the prompt asks for the main kinds of subjects, including less typical ones.
+- Each cluster gets a one-sentence description of at most 30 words from **Qwen3-8B**. The description is written from up to 300 of the cluster's page titles, most typical first, and the prompt asks for the main kinds of subjects, including less typical ones (our wording is under Gaps and decisions).
 
 ### Navigation
 
@@ -74,13 +74,19 @@ These details are not given in the paper. Each is set in `config.yaml` so it can
 | k-means settings | faiss k-means, k = 1,000, spherical, 25 iterations, 5 restarts, no subsampling | Fast and deterministic. We build seeds 0, 1 and 2 to measure how much the random clustering moves results |
 | e5 pooling | Mean pooling over tokens (e5's own), fp16 on GPU, max 512 tokens | e5's documented usage |
 | What "most typical" titles means | Titles sorted by cosine similarity to the cluster centroid, highest first; at most 300 | The natural reading of "most typical" for k-means |
-| Exact Qwen prompt and generation settings | A prompt written from the paper's description (below), greedy decoding, thinking off, output cut at 30 words | The paper's prompt is not released; greedy decoding makes the descriptions repeatable |
+| Exact Qwen prompt and generation settings | A prompt written from the paper's description (below), greedy decoding, thinking off. It asks for 25 words so outputs land under the paper's 30. Outputs over 30 words are shortened by the model with a second prompt (below), and only cut if still too long | The paper's prompt is not released; greedy decoding makes the descriptions repeatable. A first draft that said "including less typical ones" made the model echo "typical … less typical" in its output, focus on the first titles, and overrun 30 words in 5–7% of clusters, which were then cut mid-sentence |
 
-Description prompt (draft):
+Description prompt:
 
-> Below are titles of Wikipedia pages that belong to one group, most typical first. Write one sentence of at most 30 words describing the main kinds of subjects in this group, including less typical ones. Output only the sentence.
+> Below are the titles of Wikipedia pages in one group, most typical first. Write one sentence of at most 25 words naming the kinds of subjects in the group. Cover the whole list, including kinds that only appear further down, not just the first titles. Name kinds of subjects rather than individual titles, and do not use the words "typical" or "less typical". Output only the sentence.
 >
 > {titles, one per line}
+
+Shortening prompt (only for outputs over 30 words):
+
+> Shorten this description of a group of Wikipedia pages to one complete sentence of at most 25 words, keeping the kinds of subjects it names. Output only the sentence.
+>
+> {description}
 
 ### Navigation
 
