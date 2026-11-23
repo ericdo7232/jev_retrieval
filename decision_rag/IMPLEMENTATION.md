@@ -23,7 +23,9 @@ Because the decision model differs from the paper's, results are not expected to
 
 - Each page is represented by its title and first sentence, embedded with **e5-base-v2**.
 - **k-means into 1,000 clusters**, holding 15–350 pages each (median 106).
-- Each cluster gets a one-sentence description of at most 30 words from **Qwen3-8B**. The description is written from up to 300 of the cluster's page titles, most typical first, and the prompt asks for the main kinds of subjects, including less typical ones (our wording is under Gaps and decisions).
+- Each cluster gets a one-sentence description of at most 30 words from **Qwen3-8B**, written from up to 300 of the cluster's page titles, most typical first. The prompt (App. B.5), verbatim: "Write one sentence (at most 30 words) describing what the pages in this group are about. Name the main kinds of subjects it covers, including the less typical ones, so that a reader can tell whether a given Wikipedia page would belong to this group."
+
+**What the paper does not evaluate** (checked against the full text, arXiv v1): it never measures the hierarchy directly. There is no intrinsic cluster metric, no comparison of k-means with another way of building the tree, no variation of k or the k-means seed, no per-stage routing recall (how often the gold page's cluster is pruned), no error analysis of where gold is lost on NQ, and no evaluation, example or ablation of the descriptions. The evidence about the hierarchy is end-to-end retrieval, the cluster-budget sweep (below), and one whole-pipeline number (§6.5): the dense top 100 contains the gold evidence more often than the navigated candidates (98.4% against 94.0%). Its limitations section (§7) says "uninformative descriptions can therefore hurt retrieval quality". This is the gap the proposal targets; we log the gold cluster's, page's and paragraph's rank at every stage so that per-level routing recall comes out of every run.
 
 ### Navigation
 
@@ -38,7 +40,8 @@ Because the decision model differs from the paper's, results are not expected to
 - **Multiple choice:** probabilities over the options, summing to 1 (Jev's limit is 255 options).
 - **Prompt context:** the query, then the candidates, numbered and in document order, grouped under their parents. Each stage builds a new context, and earlier probabilities are not shown to the model.
 - **Pruning is final:** a dropped branch is never revisited for that query.
-- **Question wording (App. B.1):**
+- **Question wording (App. B.1, B.5):**
+  - Clusters, labelled "Topic nn": quoted as "the page with the information needed to answer the user's question [is] likely in Topic nn"; we ask "Is the page with the information needed to answer the user's question likely in Topic nn?"
   - Pages: "Is the information needed to answer the user's question on Page nn?"
   - Paragraphs: "Does Paragraph nn contain information needed to answer the user's question?"
 
@@ -51,7 +54,7 @@ Because the decision model differs from the paper's, results are not expected to
 | nDCG@10 | 76.0 | 69.0 |
 | Median latency | 1.73 s | 5.8 s |
 
-Cluster budget ablation (first 100 questions): keeping 15% of clusters gives R@10 86.2, against 84.5 for flat scoring of all 108,626 page titles. Recall levels off above about 10% and drops below 5%; at 1%, R@10 is 63.7.
+Cluster budget ablation (§6.6, Fig. 7, first 100 questions): keeping 15% of clusters gives R@10 86.2 (2.3¢, 1.7 s per query), against 84.5 for flat scoring of all 108,626 page titles (12.1¢, 4.5 s). Recall "rises steeply up to about 10% of the clusters and then stays level"; below 5% the gold page's cluster is often discarded, and at 1% R@10 is 63.7. Other budgets appear only in the plot.
 
 ## Gaps and decisions
 
@@ -74,13 +77,11 @@ These details are not given in the paper. Each is set in `config.yaml` so it can
 | k-means settings | faiss k-means, k = 1,000, spherical, 25 iterations, 5 restarts, no subsampling | Fast and deterministic. We build seeds 0, 1 and 2 to measure how much the random clustering moves results |
 | e5 pooling | Mean pooling over tokens (e5's own), fp16 on GPU, max 512 tokens | e5's documented usage |
 | What "most typical" titles means | Titles sorted by cosine similarity to the cluster centroid, highest first; at most 300 | The natural reading of "most typical" for k-means |
-| Exact Qwen prompt and generation settings | A prompt written from the paper's description (below), greedy decoding, thinking off. It asks for 25 words so outputs land under the paper's 30. Outputs over 30 words are shortened by the model with a second prompt (below), and only cut if still too long | The paper's prompt is not released; greedy decoding makes the descriptions repeatable. A first draft that said "including less typical ones" made the model echo "typical … less typical" in its output, focus on the first titles, and overrun 30 words in 5–7% of clusters, which were then cut mid-sentence |
+| How titles are put into the description prompt, and generation settings | The paper's prompt verbatim, then "Page titles (most typical first):" and one title per line; greedy decoding, thinking off. Outputs over 30 words are shortened by the model with a second prompt (below), and only cut if still too long | The paper gives the prompt (App. B.5) but not the title layout or decoding; greedy decoding makes the descriptions repeatable. Over-long outputs were 5–7% of clusters in a first run, and cutting them left sentences unfinished |
 
-Description prompt:
+Our first run used our own wording, written before we found the paper's prompt. It echoed "typical … less typical" and sometimes described only the first titles (e.g. "Lennon–McCartney songs" for a cluster that also holds George Harrison songs). A rewrite fixed that, but we use the paper's prompt for the reproduction; the rewrite is a candidate improvement for the proposal's trees:
 
 > Below are the titles of Wikipedia pages in one group, most typical first. Write one sentence of at most 25 words naming the kinds of subjects in the group. Cover the whole list, including kinds that only appear further down, not just the first titles. Name kinds of subjects rather than individual titles, and do not use the words "typical" or "less typical". Output only the sentence.
->
-> {titles, one per line}
 
 Shortening prompt (only for outputs over 30 words):
 
@@ -93,12 +94,12 @@ Shortening prompt (only for outputs over 30 words):
 | Gap | Decision | Why |
 |---|---|---|
 | Full prompts (only per-stage questions are given) | The paper's questions verbatim, inside a short fixed instruction plus the query and numbered candidates. Templates live in `prompts/` | Keeps the published wording where it exists |
-| Question for the cluster stage (none given for NQ) | "Is the information needed to answer the user's question in Group nn?" | Adapted from the page-stage question |
+| Exact cluster-stage question | "Is the page with the information needed to answer the user's question likely in Topic nn?", clusters labelled "Topic nn" | App. B.5 quotes the clause and the label but not a full question sentence |
 | How the 1,000 clusters are split into 8 requests | 125 clusters per request, in cluster-ID order | Even split; the paper gives no order |
 | How pages are shown | Title only, grouped under their cluster's description, clusters in rank order, pages by cluster then corpus order; split into requests of at most 20k tokens without breaking up a cluster where possible | The paper says "page titles" and grouping under parents |
 | How paragraphs are shown | Full paragraph text, grouped under the page title, pages in rank order and paragraphs in document order | Matches "grouped under parents, in document order" |
 | Very long paragraphs | Truncated at 512 tokens | Keeps the shared context bounded; affects few paragraphs |
-| Final rerank format | The 5 paragraphs as options, each shown with its page title; context limited to the options | The paper says the context is restricted to the options |
+| Final rerank format | The 5 paragraphs as options, each shown with its page title; context limited to the options | App. B.6: the context "lists only these candidates, in reading order and formatted as in binary scoring"; the question wording is not given |
 | Ties | Broken by document order | Deterministic |
 | Pages with multiple clusters | Not applicable: k-means gives each page exactly one cluster | |
 

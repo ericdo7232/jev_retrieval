@@ -21,7 +21,7 @@ echo "Node $(hostname)"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 PY="$DRAG_DIR/.venv/bin/python"
 source slurm/triton_tools.sh
-for step in ${STEPS:-embed kmeans describe}; do
+for step in ${STEPS:-embed kmeans describe check}; do
   echo "=== step: $step ==="
   "$DRAG_DIR/.venv/bin/python" scripts/build_hierarchy.py --steps "$step" "$@"
 done

@@ -15,9 +15,9 @@ import time
 import urllib.error
 import urllib.request
 
-# Question wording from DecisionRAG App. B.1. The group question is our adaptation of the page question
-# (see ../decision_rag/IMPLEMENTATION.md).
-Q_GROUP = "Is the information needed to answer the user's question in Group {n}?"
+# Question wording from DecisionRAG App. B.1 (page, paragraph) and B.5 (cluster: the paper quotes it as
+# "the page with the information needed to answer the user's question [is] likely in Topic nn").
+Q_GROUP = "Is the page with the information needed to answer the user's question likely in Topic {n}?"
 Q_PAGE = "Is the information needed to answer the user's question on Page {n}?"
 Q_PARA = "Does Paragraph {n} contain information needed to answer the user's question?"
 
@@ -153,7 +153,7 @@ def scale_workload(name, seed):
     query = NEEDLES[0]["query"]
     if stage == "stage1":
         lines = [f"User question: {query}", ""]
-        lines += [f"Group {i + 1}: {make_description(rng)}" for i in range(n)]
+        lines += [f"Topic {i + 1}: {make_description(rng)}" for i in range(n)]
         state, questions = "\n".join(lines), [Q_GROUP.format(n=i + 1) for i in range(n)]
     elif stage == "stage2":
         titles = [make_title(rng) for _ in range(n)]

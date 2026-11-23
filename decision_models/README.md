@@ -22,7 +22,20 @@ Checked on CPU against the unmodified Transformers model, using a tiny random mo
 
 The scorer also has `exact` (each question alone, the state recomputed every time), `joint`, and `official` / `official_masked` (the Transformers model, for checking).
 
-**GPUs:** the weights are about 52 GB in bf16, so the 64 layers are split across two A6000s: 31 on the first GPU with the embeddings, 33 on the second. The A6000 doesn't support FP8, so there is no quantization, and answers match the model card's bf16 numbers.
+**GPUs:** in bf16 the weights are about 52 GB, so the 64 layers are split across two A6000s: 31 on the first GPU with the embeddings, 33 on the second; answers match the model card's bf16 numbers. With `--fp8` (RTX 6000 Ada only, see below) the model fits on one GPU.
+
+## Making it faster
+
+The bf16 run on 2 × A6000 took about 15 minutes per DecisionRAG question (~1.3M tokens through a 27B model), about a week for 500 questions. pplx is a stand-in until Jev API access, and final numbers (and latency) will come from the Jev API, so we trade a little fidelity for speed, and measure what each shortcut costs.
+
+| Speed-up | Gain | Fidelity cost | Where | Status |
+|---|---|---|---|---|
+| FP8 on one RTX 6000 Ada | FP8 tensor cores; one GPU per model copy instead of two | FP8 rounding; `reference` step compares with bf16 | `pplx/fp8.py`, `--fp8` | Built, awaiting the Ada smoke test |
+| Fast mode: shorter question branches | 1.84x fewer tokens per question (1.31M → 0.71M) | Full-attention layers only; `fast` step compares with forked | `score(..., mode="fast")` | Built, awaiting the Ada smoke test |
+| MLP in chunks of 8,192 tokens | Lower peak memory on long states (needed to fit one 48 GB GPU) | None (per-token operation) | `Scorer(mlp_chunk=8192)` | Built |
+| Timing without compilation | A fair estimate: each workload runs twice, the second is used (the first call of a new shape spent ~20 s compiling kernels) | None | `pplx/smoke.py` | Built |
+| Keep 10% of clusters instead of 15% | Stage 2 about ⅓ smaller (~0.5M tokens per question in total) | The paper's ablation shows recall levels off above 10% | DecisionRAG navigator | Planned |
+| Questions split across GPU jobs, resuming after preemption | Linear in the number of GPUs | None | DecisionRAG navigator | Planned |
 
 ## Running on the cluster (Unicorn, partition `lil-interns`)
 
@@ -40,12 +53,13 @@ Logs: `logs/pplx-setup-<job>.out` and `logs/pplx-smoke-<job>.out`. Results go to
 
 | Step | Pass if |
 |---|---|
-| `load` | Model loads and is split across both GPUs (prints weights per GPU) |
-| `kernels` | Forked scoring with the GPU kernels (flash-linear-attention, varlen FlashAttention) agrees with the Transformers model run with the same attention pattern: mean \|Δp\| < 0.01, max < 0.05 |
+| `load` | Model loads (prints precision, layers and weights per GPU) |
+| `kernels` | Forked scoring with the GPU kernels (flash-linear-attention, varlen FlashAttention) agrees with the Transformers model run with the same attention pattern: mean \|Δp\| < 0.01, max < 0.05 (FP8: < 0.02 and < 0.1, since FP8 turns tiny round-off differences into occasional rounding flips) |
 | `smoke` | P(refund) > 0.5 > P(late delivery) on an obvious customer message |
 | `needle` | Gold page in the top 5 of 200 titles for at least 5 of the 6 queries |
 | `isolation` | Re-asking 29 questions in another subset and order changes P(yes) by less than 0.02 |
-| `timing` | Information only: seconds, tokens/s and peak memory on stage-sized workloads (each run twice; the second, without kernel compilation, is used), and an estimate per DecisionRAG query |
+| `fast` | Fast mode against forked on the 6 needle workloads (1,200 questions): gold page still in the top 5 for at least 5 of 6, mean \|Δp\| < 0.05; also prints the token counts |
+| `timing` | Information only: seconds, tokens/s and peak memory on stage-sized workloads, for forked and fast (each run twice; the second, without kernel compilation, is used), and an estimate per DecisionRAG query |
 | `reference` | Only with `--reference old.json`: answers on the same workloads agree with an earlier run (e.g. FP8 against bf16): mean \|Δp\| < 0.02, max < 0.15, needle gold ranks unchanged |
 
 ## FP8 on one RTX 6000 Ada (`--fp8`, `pplx/fp8.py`)
@@ -79,17 +93,18 @@ Both shortcuts only change the 16 full-attention layers (shared tokens don't see
   ```
 - **`kernels` fails but the other steps pass:** a GPU kernel disagrees with Transformers. Paste the log.
 - **"varlen attention returns log-sum-exp: no"** in the setup log: forked scoring still works, but attention over the shared state runs in plain PyTorch (slower).
-- **Out of memory:** lower `--budget` (tokens per forward pass, default 16384) in `slurm/pplx-smoke.sub`.
+- **Out of memory:** lower `--budget` (tokens per forward pass, default 16384), passed after the script, e.g. `sbatch slurm/pplx-smoke-ada.sub --budget 8192 ...`.
+- **`load` says `FP8 rowwise_emulated`:** this torch build has no rowwise FP8 kernel for the GPU; the same numbers are computed with an extra pass (slightly slower).
 
 ## Files
 
 ```
 env.sh                  paths (WORK_DIR, PPLX_CKPT)
 common.py               workloads (stage-shaped, needle questions)
-pplx/scorer.py          forked / exact / joint scoring, layers split across GPUs, optional FP8
+pplx/scorer.py          forked / fast / exact / joint scoring, layers split across GPUs, optional FP8
 pplx/fp8.py             FP8 linear layers (per-channel weights, per-token activations)
 pplx/smoke.py           cluster smoke test
-tests/test_fp8.py       CPU tests: FP8 layer, FP8 and chunked-MLP scorer paths
+tests/test_fp8.py       CPU tests: FP8 layer, FP8, fast-mode and chunked-MLP scorer paths
 pplx/setup.sh           environment + checkpoint download
 slurm/setup.sub         runs pplx/setup.sh (CPU job)
 slurm/pplx-smoke.sub    smoke test on 2 x A6000 (bf16)

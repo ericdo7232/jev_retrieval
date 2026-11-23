@@ -35,7 +35,7 @@ def fake_generate(texts):
         if t.startswith("<user>Shorten"):
             out.append(" ".join(body.split()[:4]))
             continue
-        first = body.splitlines()[0]
+        first = next(l for l in body.splitlines() if l[:1] == "T" and l[1:].isdigit())
         pad = " and more" * 20 if int(first[1:]) % 2 == 0 else ""
         out.append(f"<think>\n\n</think>\n\nGroup led by {first}.{pad}")
     return out

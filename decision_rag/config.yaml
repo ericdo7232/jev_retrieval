@@ -28,14 +28,23 @@ hierarchy:
     seeds: [0, 1, 2]              # three trees, to measure how much the random clustering moves results
   typical_titles: 300             # titles per description prompt, most similar to the centroid first
 
+check:                            # quick e5 routing check of the trees (scripts/build_hierarchy.py --steps check)
+  query_prefix: "query: "         # e5's query prefix
+  budgets: [0.01, 0.05, 0.10, 0.15]  # share of clusters kept (paper's sweep; it keeps 15%)
+  tree_budget: 0.15               # for the pages comparison: flat vs inside this share of clusters
+  pages_kept: 30                  # stage 2 keeps the top 30 pages
+  show_worst: 5
+
 describe:
   model: Qwen/Qwen3-8B
   backend: vllm                   # vllm, or transformers (slower fallback, used automatically if vllm fails)
   max_new_tokens: 80
-  max_words: 30                   # hard cap; longer outputs are first shortened by the model (shorten_prompt), then cut
+  max_words: 30                   # the paper's limit; longer outputs are first shortened by the model (shorten_prompt), then cut
+  # The paper's prompt (App. B.5), verbatim; how the titles are inserted is not given, so they follow on their own lines.
   prompt: |-
-    Below are the titles of Wikipedia pages in one group, most typical first. Write one sentence of at most 25 words naming the kinds of subjects in the group. Cover the whole list, including kinds that only appear further down, not just the first titles. Name kinds of subjects rather than individual titles, and do not use the words "typical" or "less typical". Output only the sentence.
+    Write one sentence (at most 30 words) describing what the pages in this group are about. Name the main kinds of subjects it covers, including the less typical ones, so that a reader can tell whether a given Wikipedia page would belong to this group.
 
+    Page titles (most typical first):
     {titles}
   shorten_prompt: |-
     Shorten this description of a group of Wikipedia pages to one complete sentence of at most 25 words, keeping the kinds of subjects it names. Output only the sentence.

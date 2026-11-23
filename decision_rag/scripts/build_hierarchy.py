@@ -1,7 +1,8 @@
 """Step 2: e5 page embeddings, k-means trees for every seed, Qwen3-8B cluster descriptions.
 One GPU. Run with slurm/hierarchy.sub.
 
-  --steps embed,kmeans,describe   any subset; each step reuses the previous steps' files
+  --steps embed,kmeans,describe,check   any subset; each step reuses the previous steps' files
+                                  (check: e5 routing recall of the test questions, see src/decision_rag/check.py)
   --seeds 0,1,2                   default: config hierarchy.kmeans.seeds
   --backend vllm|transformers     description backend (default: config)
 """
@@ -27,7 +28,7 @@ if __name__ == "__main__":
         # faiss and torch each start their own OpenMP runtime; in one process they can deadlock. slurm/hierarchy.sub
         # runs each step as its own process.
         print("note: running kmeans in the same process as other steps; prefer one step per process", flush=True)
-    if "embed" in steps or "describe" in steps:
+    if "embed" in steps or "describe" in steps or "check" in steps:
         import torch
         print(f"torch {torch.__version__}, CUDA available {torch.cuda.is_available()}", flush=True)
         if "describe" in steps and not torch.cuda.is_available():
@@ -43,3 +44,6 @@ if __name__ == "__main__":
     if "describe" in steps:
         from decision_rag.describe import describe_trees
         describe_trees(cfg, seeds, backend=args.backend)
+    if "check" in steps:
+        from decision_rag.check import check_trees
+        check_trees(cfg, seeds)
