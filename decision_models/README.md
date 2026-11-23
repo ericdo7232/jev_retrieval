@@ -60,6 +60,15 @@ The 2 × A6000 bf16 run measured about 1,000–1,400 tokens/s, roughly 15 minute
 sbatch slurm/pplx-smoke-ada.sub --reference results/pplx_smoke_<bf16 run>.json
 ```
 
+## Fast mode (`score(..., mode="fast")`)
+
+pplx adds a 48-token template to every yes/no question, and only the page number differs between candidates: about 85% of the tokens in stage 2. Fast mode is forked scoring with two shortcuts, cutting a branch from ~51 to ~19 tokens and a DecisionRAG question from ~1.31M to ~0.71M tokens (1.84x):
+
+- The question text up to the first digit ("Question 0: Is the information … on Page ") is computed once as part of the shared state.
+- Branches end at the readout marker; the 9 chat-template tokens after it are dropped.
+
+Both shortcuts only change the 16 full-attention layers (shared tokens don't see the branch; the marker doesn't see the dropped tokens). The shared part depends only on the question template, so answers still don't depend on the other questions. The smoke test's `fast` step measures the agreement with forked on 1,200 needle questions. Final numbers come from the Jev API; this is for the pplx proof of concept.
+
 `default_partition` is preemptible; resubmit if the job is preempted. CPU tests of the FP8 layer and the scorer paths: `PPLX_TEST_CKPT=<dir with the checkpoint's small files> python -m pytest -q tests`.
 
 ## If something fails

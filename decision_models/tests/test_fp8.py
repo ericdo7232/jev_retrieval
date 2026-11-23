@@ -145,3 +145,42 @@ def test_fp8_scorer_uses_fp8_everywhere_and_stays_isolated(workload, mode, monke
     idx = [9, 4, 0, 7, 2]
     sub = s.score(state, [qs[i] for i in idx], "forked")
     assert max(abs(forked["margin"][i] - m) for i, m in zip(idx, sub["margin"])) < 1e-4
+
+
+# ---------------------------------------------------------------- fast mode (shortened branches)
+
+def test_fork_text():
+    from scorer import fork_text
+    page = "Is the information needed to answer the user's question on Page {}?"
+    assert fork_text([page.format(n) for n in (17, 3, 250)]) == page.split("{}")[0]
+    assert fork_text([page.format(12), page.format(17)]) == page.split("{}")[0]  # not "... Page 1"
+    assert fork_text([page.format(5)]) == page.split("{}")[0]                     # same for one question
+    assert fork_text(["Is it red?", "Is it blue?"]) == "Is it "
+
+
+@needs_ckpt
+def test_fast_matches_transformers_with_the_same_shortcuts_and_is_isolated(workload):
+    state, qs = workload
+    s = tiny_scorer()
+    fast = s.score(state, qs, "fast")
+    # Reference: the unmodified Transformers forward on each shortened request, with the shared tokens (state and
+    # shared question start) not attending to the branch.
+    questions = [{"type": "noul", "instructions": t} for t in qs]
+    shared, branches, tail = s._split(state, questions)
+    shared, cut = s.shorten(shared, branches, tail, qs)
+    assert all(len(c) <= 22 for c in cut) and all(len(b) >= 48 for b in branches)
+    ref = []
+    for b in cut:
+        n, p = len(shared) + len(b), len(shared)
+        mask = torch.ones(n, n, dtype=torch.bool)
+        mask[:p, p:] = False
+        ref.append(s._official(shared + b, mask))
+    ref = torch.cat(ref)[:, :2]
+    assert max(abs(m - (r[1] - r[0]).item()) for m, r in zip(fast["margin"], ref)) < 1e-4
+    # Isolation: the shared question start depends only on the template, so subsets give the same answers.
+    idx = [9, 4, 0, 7, 2]
+    sub = s.score(state, [qs[i] for i in idx], "fast")
+    assert max(abs(fast["margin"][i] - m) for i, m in zip(idx, sub["margin"])) < 1e-4
+    # And it stays near forked on this random model (the approximation is in the full-attention layers only).
+    forked = s.score(state, qs, "forked")
+    assert fast["tokens"] < 0.75 * forked["tokens"]

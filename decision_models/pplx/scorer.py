@@ -43,7 +43,25 @@ import torch
 import torch.nn.functional as F
 
 QUESTION_START = "\n\nQuestion 0:\n"
-MODES = ("exact", "joint", "forked", "official", "official_masked")
+MODES = ("exact", "joint", "forked", "fast", "official", "official_masked")
+
+
+def fork_text(instructions):
+    """The start all instructions share, cut so it does not depend on which questions are asked: the text before
+    the first digit if every instruction has the same one (templated questions like "... on Page 17?"), else the
+    common prefix cut back to the last space."""
+    first = instructions[0]
+    digit = next((i for i, c in enumerate(first) if c.isdigit()), None)
+    if digit is not None and all(t[:digit] == first[:digit] and len(t) > digit and t[digit].isdigit()
+                                 for t in instructions):
+        return first[:digit]
+    common = first
+    for t in instructions[1:]:
+        i = 0
+        while i < min(len(common), len(t)) and common[i] == t[i]:
+            i += 1
+        common = common[:i]
+    return common[: common.rfind(" ") + 1]
 
 
 def import_package(checkpoint):
@@ -321,6 +339,10 @@ class Scorer:
         The shared part stops a few tokens before the end of the state, because the last state tokens can merge with
         the question's first tokens; those few tokens are repeated in every branch. Checked on `checks` questions.
         """
+        return self._split(state, questions, checks)[:2]
+
+    def _split(self, state, questions, checks=8):
+        """split(), plus the text of the state's last few tokens that every branch starts with."""
         texts = [self.question_text(q) for q in questions]
         full0 = self.encoder.text({"state": state, "questions": {"q": questions[0]}})
         if not full0.endswith(texts[0]):
@@ -343,7 +365,27 @@ class Scorer:
             raise RuntimeError("split tokens differ from the package's encoder")
         if self.marker_id in shared or any(b.count(self.marker_id) != 1 for b in branches):
             raise RuntimeError("expected exactly one readout marker per branch and none in the state")
-        return shared, branches
+        return shared, branches, tail
+
+    def shorten(self, shared, branches, tail, instructions, fork_at=None):
+        """fast mode: move the question text every branch shares into the state, and end branches at the marker.
+
+        fork_at: the start every instruction shares (e.g. "Is the information ... on Page "); default: the text
+        before the first digit, if all instructions share it, else their common prefix cut to a word boundary.
+        It depends only on the question template, not on which questions are in the request, so answers stay
+        independent of the other questions. Approximations (full-attention layers only): the shared question
+        tokens do not see the branch's own tokens, and the template tokens after the marker are dropped.
+        """
+        if fork_at is None:
+            fork_at = fork_text(instructions)
+        if not all(t.startswith(fork_at) for t in instructions):
+            raise ValueError("every instruction must start with fork_at")
+        ids = self.tok(tail + QUESTION_START + fork_at, add_special_tokens=False)["input_ids"]
+        n = min(len(ids), min(len(b) for b in branches) - 1)
+        while n > 0 and not all(b[:n] == ids[:n] for b in branches):  # last token may merge with the next text
+            n -= 1
+        cut = [b[n:b.index(self.marker_id) + 1] for b in branches]
+        return shared + ids[:n], cut
 
     # ------------------------------------------------------------------ forward
 
@@ -478,9 +520,11 @@ class Scorer:
 
     # ------------------------------------------------------------------ public
 
-    def score(self, state, instructions, mode="forked"):
+    def score(self, state, instructions, mode="forked", fork_at=None):
         """Yes/no questions (instruction strings) about `state`.
 
+        mode "fast" is forked with shorter branches (see shorten(); fork_at is passed to it): ~20 tokens per
+        question instead of ~52, so about 2.5x fewer tokens when there are many short candidates.
         Returns logits [[false, true], ...], margin (true - false, for ranking), p (calibrated P(true)),
         tokens (tokens run through the model), seconds.
         """
@@ -496,8 +540,10 @@ class Scorer:
             rows = torch.cat(self._run_packed(seqs))
             tokens, sequences = sum(len(s) for s in seqs), len(seqs)
         else:
-            shared, branches = self.split(state, questions)
-            if mode == "forked":
+            shared, branches, tail = self._split(state, questions)
+            if mode == "fast":
+                shared, branches = self.shorten(shared, branches, tail, instructions, fork_at)
+            if mode in ("forked", "fast"):
                 _, prefix = self._stack(torch.tensor(shared), torch.arange(len(shared)), Pack([len(shared)]),
                                         capture=True)
                 rows = torch.cat(self._run_packed(branches, start_positions=len(shared), prefix=prefix))

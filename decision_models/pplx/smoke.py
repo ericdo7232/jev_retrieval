@@ -9,6 +9,7 @@ Steps (each prints PASS, FAIL or INFO; the exit code is 1 if any step fails):
   isolation  the same questions asked in a different subset and order: answers must not change
   timing     stage-shaped workloads, each run twice: the first call includes kernel compilation for new shapes,
              the second is the steady-state speed used for the per-query estimate; tokens/s, peak GPU memory
+  fast       fast mode (shortened branches, ~2x fewer tokens) against forked on the needle workloads
   reference  with --reference: this run's answers against an earlier run's (e.g. FP8 against bf16) on the same
              deterministic workloads: |dp| on the kernels, smoke and needle questions, needle ranks and top 5
 
@@ -160,21 +161,47 @@ def main():
 
     # ---- timing
     def timing():
-        rows = {}
-        for name in TIMING:
-            w = scale_workload(name, seed=1)
-            reset_peaks(s)
-            first = s.score(w["state"], w["questions"], "forked")
-            r = s.score(w["state"], w["questions"], "forked")
-            rows[name] = {"seconds": round(r["seconds"], 2), "first_call_seconds": round(first["seconds"], 2),
-                          "tokens": r["tokens"], "tokens_per_s": round(r["tokens"] / r["seconds"]),
-                          "peak_gib": peak_gib(s)}
-            print(f"    {name}: {rows[name]}", flush=True)
-        est = sum(rows[k]["seconds"] * n for k, n in PER_QUERY.items())
+        rows, est = {}, {}
+        for mode in ("forked", "fast"):
+            rows[mode] = {}
+            for name in TIMING:
+                w = scale_workload(name, seed=1)
+                reset_peaks(s)
+                first = s.score(w["state"], w["questions"], mode)
+                r = s.score(w["state"], w["questions"], mode)
+                rows[mode][name] = {"seconds": round(r["seconds"], 2), "first_call_seconds": round(first["seconds"], 2),
+                                    "tokens": r["tokens"], "tokens_per_s": round(r["tokens"] / r["seconds"]),
+                                    "peak_gib": peak_gib(s)}
+                print(f"    {mode} {name}: {rows[mode][name]}", flush=True)
+            est[mode] = sum(rows[mode][k]["seconds"] * n for k, n in PER_QUERY.items())
         gpus = len(set(s.layer_devices))
-        report("timing", None, f"estimated {est:.0f} s per DecisionRAG query on {gpus} GPU(s), steady state "
-                               f"(8 x stage1_125 + 7 x stage2_2500 + stage3_230; paper: 1.7 s with Jev)",
+        report("timing", None, f"estimated s per DecisionRAG query on {gpus} GPU(s), steady state: forked "
+                               f"{est['forked']:.0f}, fast {est['fast']:.0f} (8 x stage1_125 + 7 x stage2_2500 + "
+                               f"stage3_230, 15% of clusters kept; paper: 1.7 s with Jev)",
                workloads=rows, est_seconds_per_query=est, gpus=gpus)
+
+    # ---- fast: shortened branches against forked, on the 6 needle workloads (1,200 questions)
+    def fast():
+        if "needle" not in out["steps"] or "queries" not in out["steps"]["needle"]:
+            raise ValueError("needs the needle step")
+        dp, rows = [], []
+        for i, (nd, ref) in enumerate(zip(NEEDLES, out["steps"]["needle"]["queries"])):
+            w = needle_workload(nd, 200, seed=i)
+            r = s.score(w["state"], w["questions"], "fast")
+            m = r["margin"]
+            top = [w["titles"][j] for j in sorted(range(len(m)), key=lambda j: -m[j])[:5]]
+            dp += [abs(a - b) for a, b in zip(ref["p"], r["p"])]
+            rows.append({"query": nd["query"], "gold_rank": gold_rank(m, w["gold_index"]),
+                         "forked_gold_rank": ref["gold_rank"], "top5_overlap": len(set(top) & set(ref["top5"])),
+                         "tokens": r["tokens"], "forked_tokens": ref["tokens"]})
+        top5 = sum(r["gold_rank"] <= 5 for r in rows)
+        overlap = statistics.mean(r["top5_overlap"] for r in rows)
+        ok = top5 >= 5 and statistics.mean(dp) < 0.05
+        report("fast", ok, f"vs forked on {len(dp)} questions: mean |dp| {statistics.mean(dp):.4f}, max |dp| "
+                           f"{max(dp):.4f}; gold in top 5 {top5}/6 (ranks {[r['gold_rank'] for r in rows]}), "
+                           f"top-5 overlap {overlap:.1f}/5; tokens {sum(r['tokens'] for r in rows)} vs "
+                           f"{sum(r['forked_tokens'] for r in rows)} (want gold in top 5 >= 5/6, mean |dp| < 0.05)",
+               mean_abs_dp=statistics.mean(dp), max_abs_dp=max(dp), queries=rows)
 
     # ---- reference: the same deterministic workloads in an earlier run (e.g. bf16 on A6000s)
     def compare():
@@ -210,7 +237,7 @@ def main():
     s.score("Warm-up state.", ["Is this a warm-up?"], "forked")
     s.score("Warm-up state number two, a little longer. " * 20, [f"Is this warm-up {i}?" for i in range(37)],
             "forked")
-    steps = [("kernels", kernels), ("smoke", smoke), ("needle", needle), ("isolation", isolation),
+    steps = [("kernels", kernels), ("smoke", smoke), ("needle", needle), ("isolation", isolation), ("fast", fast),
              ("timing", timing)]
     if reference is not None:
         steps.append(("reference", compare))
