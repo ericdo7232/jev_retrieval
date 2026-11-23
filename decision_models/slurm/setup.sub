@@ -1,0 +1,20 @@
+#!/bin/bash
+# One-time install and weight download for both models, run as a job so nothing heavy runs on the login node.
+# Submit from decision_models/:   sbatch slurm/setup.sub
+# No GPU needed: this installs Python environments and downloads ~106 GB of weights into $WORK_DIR.
+#SBATCH --job-name=dm-setup
+#SBATCH --partition=lil-interns
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/%x-%j.out
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
+source ./env.sh
+echo "WORK_DIR=$WORK_DIR  HF_HOME=$HF_HOME"
+df -h "$(dirname "$WORK_DIR")" || true
+
+status=0
+bash kev/setup.sh || { echo "kev/setup.sh FAILED"; status=1; }
+bash jev27b/setup.sh || { echo "jev27b/setup.sh FAILED (see the vLLM check above)"; status=1; }
+exit $status

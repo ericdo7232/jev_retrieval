@@ -1,21 +1,23 @@
 #!/bin/bash
-# Test 1: Kev-27B. Submit from decision_models/:   sbatch slurm/kev.sbatch
-# Or, inside an interactive GPU session:           bash slurm/kev.sbatch
+# Test 1: Kev-27B on Unicorn. Submit from decision_models/:   sbatch slurm/kev.sub
+#
+# Kev-27B is 51 GB in bf16, more than one A6000 (48 GB). Kev's own server runs on one GPU only, so kev/setup.sh applies
+# split-gpus.patch and kev/serve.sh spreads the layers over the two GPUs this job gets. That path runs without Kev's
+# CUDA graphs and fused kernels, so its timings understate Kev on one 80 GB GPU; its answers are unaffected.
 #SBATCH --job-name=kev-bench
-#SBATCH --gres=gpu:1
+#SBATCH --partition=lil-interns
+#SBATCH --gres=gpu:nvidia_rtx_a6000:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=02:00:00
 #SBATCH --output=logs/%x-%j.out
-# Uncomment and set for your cluster. The GPU needs >= 80 GB (A100-80GB, H100, H200).
-##SBATCH --partition=YOUR_PARTITION
-##SBATCH --constraint=YOUR_80GB_GPU_FEATURE
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 source ./env.sh
 mkdir -p logs results
 JOB="${SLURM_JOB_ID:-local}"
 PY="$WORK_DIR/kev/.venv/bin/python"
+echo "Node $(hostname), GPUs: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | paste -sd ';')"
 
 setsid bash kev/serve.sh > "logs/kev-server-$JOB.log" 2>&1 &
 PID=$!

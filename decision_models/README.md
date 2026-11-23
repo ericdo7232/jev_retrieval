@@ -29,28 +29,44 @@ Scale workloads (synthetic text sized like DecisionRAG's stages on Natural Quest
 
 The text in `scale` is synthetic, so it tests speed and memory only. `needle` and `position` use real questions and page titles, but they are a sanity check, not a retrieval evaluation.
 
-## Running on the cluster
+## Running on the cluster (Unicorn, partition `lil-interns`)
 
-Requirements: one GPU with at least 80 GB (A100-80GB, H100 or H200), about 120 GB of scratch space, `git`, and [`uv`](https://docs.astral.sh/uv/).
+Requirements: at least 80 GB of GPU memory in total (two A6000s here), about 120 GB of disk for weights and environments, `git`, and [`uv`](https://docs.astral.sh/uv/).
 
-1. **Copy this folder to the cluster** (for example by cloning the repo) and `cd` into `decision_models/`.
-2. **Edit `env.sh`.** Set `WORK_DIR` to a scratch directory with about 120 GB free.
-3. **Edit the `#SBATCH` lines** in `slurm/kev.sbatch` and `slurm/jev27b.sbatch`: partition, and a constraint that gets an 80 GB GPU. They assume SLURM.
-4. **Install and download**, once, on a login node or CPU job (downloads ~51 GB and ~55 GB):
+**GPUs.** Both models are 27B parameters in bf16 (51–55 GB of weights), so a single A6000 (48 GB) is too small.
+
+All jobs run on partition `lil-interns`. Both models need more memory than one 48 GB A6000, so each test uses two.
+
+| Job | GPU | How the model is split |
+|---|---|---|
+| `slurm/setup.sub` | None | Installs and downloads as a job, so nothing heavy runs on the login node |
+| `slurm/kev.sub` | Two A6000s | Kev's server supports one GPU only, so `kev/setup.sh` applies `kev/split-gpus.patch` (below), which puts different layers on each GPU |
+| `slurm/jev27b.sub` | Two A6000s | vLLM's tensor parallelism |
+
+**`kev/split-gpus.patch`.** Kev's loader moves the whole model onto one GPU. The patch (23 lines in `kev/model.py` and `kev/checkpoint.py`, against Kev commit `65b1e76`) adds `KEV_SPLIT_GPUS=N`:
+- The layers are spread across N GPUs with transformers' `device_map="balanced"`.
+- The scoring head stays on the first GPU, and the backbone's output is brought back to it.
+- Each layer's KV and DeltaNet caches stay on that layer's GPU.
+
+`kev/serve.sh` turns it on when the job has more than one GPU, along with `KEV_CUDA_GRAPHS=0` and `KEV_FUSED=0`, because Kev's CUDA graphs and fused kernels assume a single GPU. The model and its answers are unchanged. It is slower than Kev on one 80 GB GPU, so treat Kev's timings here as a lower bound.
+
+1. **Get the code.** Push from the laptop, then on the cluster clone or pull the repo and `cd` into `decision_models/`.
+2. **Optional: edit `env.sh`.** By default everything goes under `~/scratch/decision_models` (about 120 GB). The settings apply only to scripts in this folder.
+3. **Install and download**, once:
    ```bash
-   bash kev/setup.sh
-   bash jev27b/setup.sh
+   sbatch slurm/setup.sub
    ```
-   `jev27b/setup.sh` ends with a check that the installed vLLM has what JEV-27B's server needs. JEV-27B was tested on an unreleased September 2026 vLLM build, so if the check fails, rerun with a nightly build:
+   It runs `kev/setup.sh` and `jev27b/setup.sh`. The JEV-27B part ends with a check that the installed vLLM has what JEV-27B's server needs. JEV-27B was tested on an unreleased September 2026 vLLM build, so if the check fails, rerun just that part with a nightly build:
    ```bash
-   VLLM_SPEC="vllm --pre --extra-index-url https://wheels.vllm.ai/nightly" bash jev27b/setup.sh
+   sbatch --wrap 'VLLM_SPEC="vllm --pre --extra-index-url https://wheels.vllm.ai/nightly" bash jev27b/setup.sh' \
+     --partition=lil-interns --cpus-per-task=8 --mem=32G --time=02:00:00 --output=logs/jev27b-setup-%j.out
    ```
-5. **Run the tests:**
+4. **Run the tests:**
    ```bash
-   sbatch slurm/kev.sbatch      # ~30 min including model load
-   sbatch slurm/jev27b.sbatch   # two server starts (with and without prefix caching), 1-3 h
+   sbatch slurm/kev.sub      # ~30 min including model load
+   sbatch slurm/jev27b.sub   # two server starts (with and without prefix caching), 1-3 h
    ```
-   In an interactive GPU session, `bash slurm/kev.sbatch` works too. Each script starts the server, waits for it, runs `bench.py`, and stops the server. Server output goes to `logs/`.
+   Each job starts the server, waits for it, runs `bench.py`, and stops the server. Server output goes to `logs/`.
 6. **Compare:**
    ```bash
    python3 compare.py results/kev_default_*.json results/jev27b_prefix_on_*.json
@@ -82,6 +98,9 @@ Requirements: one GPU with at least 80 GB (A100-80GB, H100 or H200), about 120 G
 - **`--trust-request-chat-template`**: JEV-27B's server script asks for this flag in its docstring, but its README command leaves it out. If the server rejects requests, rerun with `TRUST_REQUEST_CHAT_TEMPLATE=1` set in the environment.
 - **`thinking: "off"`** is sent with JEV-27B requests so that no reasoning is generated. If the server rejects the field, set `JEV_THINKING=""`.
 - **Kev's fused kernels** need `flash-linear-attention` at the version pinned in Kev's source. `kev/setup.sh` reads and installs it. Without it the server still runs, but slower.
+- **Kev split across GPUs is untested.** The patch was checked against the code paths Kev-27B's serving uses, in the transformers and accelerate versions Kev pins (5.17.0, 1.15.0), but has not run on a GPU yet. The server log prints `[jev_retrieval patch] backbone split across 2 GPUs: [...]` at startup. If it fails, `logs/kev-server-*.log` will show where.
+  - **Most likely failure:** a Triton kernel from flash-linear-attention launched on the wrong GPU. To rule that out, uninstall it from Kev's environment and rerun (slower, same answers): `uv pip uninstall --python $WORK_DIR/kev/.venv/bin/python flash-linear-attention`.
+  - **Memory:** `KEV_SPLIT_MAX_MEMORY` (default 36GiB per GPU) caps how much of each GPU the weights may take. The weights need about 26 GB per GPU, so the default leaves room for activations.
 - **GPU memory** comes from `nvidia-smi`. vLLM reserves most of the GPU at startup, so JEV-27B's memory numbers are not informative. Kev's are.
 
 ## Files
@@ -92,11 +111,14 @@ bench.py             runs the tests against a running server; writes results/<mo
 compare.py           side-by-side comparison of two result files
 clients.py           HTTP clients: Kev /v1/systemone, JEV-27B /v1/decide
 common.py            workloads, needle questions, GPU monitor, HTTP helpers
-kev/setup.sh         clone Kev, install, download weights
-kev/serve.sh         start Kev's server
+kev/setup.sh         clone Kev at a pinned commit, apply split-gpus.patch, install, download weights
+kev/split-gpus.patch lets Kev's server split the model across several GPUs (KEV_SPLIT_GPUS)
+kev/serve.sh         start Kev's server (split across GPUs when the job has more than one)
 jev27b/setup.sh      install vLLM, download weights, check compatibility
 jev27b/serve.sh      start JEV-27B's server (PREFIX_CACHING=1 or 0)
-slurm/*.sbatch       one job per model
+slurm/setup.sub      one-time install and download (CPU job)
+slurm/kev.sub        Kev-27B test job
+slurm/jev27b.sub     JEV-27B test job (with and without prefix caching)
 results/, logs/      outputs (results are committed, logs are not)
 ```
 

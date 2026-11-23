@@ -1,0 +1,54 @@
+diff --git a/kev/checkpoint.py b/kev/checkpoint.py
+index 2724624..583a47a 100644
+--- a/kev/checkpoint.py
++++ b/kev/checkpoint.py
+@@ -303,7 +303,8 @@ class Checkpoint:
+         merge = merge and not self.adapter_config().get("trainable_token_indices")   # token-trained adapters stay unmerged
+         m = DecisionModel(meta.base, tok, device, lora=None, revision=meta.base_revision, head_dim=meta.head_dim,
+                           option_isolation=meta.option_isolation, dtype=dtype, attn=opts.attn)
+-        m.lm = PeftModel.from_pretrained(m.lm, self.path, torch_device=str(device)).to(device)   # trainable token embeddings, if any, live in the adapter
++        m.lm = PeftModel.from_pretrained(m.lm, self.path, torch_device=str(device))   # trainable token embeddings, if any, live in the adapter
++        if getattr(m, "split_gpus", 0) <= 1: m.lm = m.lm.to(device)   # [jev_retrieval patch] a split backbone stays where device_map put it
+         if opts.lora_scale != 1:
+             for module in m.lm.modules():
+                 if isinstance(getattr(module, "scaling", None), dict):
+diff --git a/kev/model.py b/kev/model.py
+index 1fffa11..b116caa 100644
+--- a/kev/model.py
++++ b/kev/model.py
+@@ -254,6 +254,16 @@ class DecisionModel(nn.Module):
+         # dtype: fp32 for training and exact evaluation; bf16 is a serving option for large backbones (8B on a 32 GB Mac)
+         load = {"dtype": dtype, "attn_implementation": attn}
+         if direct_load: load["device_map"] = {"": torch.cuda.current_device() if device == "cuda" else device}   # "cuda": under torchrun, this rank's GPU
++        # [jev_retrieval patch] KEV_SPLIT_GPUS=N (N > 1): split the backbone across N GPUs layer by layer (transformers
++        # device_map), so a 27B checkpoint (51 GB in bf16) runs on two 48 GB cards. The head and every index tensor stay on
++        # the current GPU (self.device), and the backbone's hidden states are brought back to it (hook below). The KV and
++        # DeltaNet caches stay with their layers (transformers skips past_key_values when moving tensors between GPUs).
++        # Serve with KEV_CUDA_GRAPHS=0 and KEV_FUSED=0: both assume one device.
++        self.split_gpus = int(os.environ.get("KEV_SPLIT_GPUS") or 0) if str(device).startswith("cuda") else 0
++        if self.split_gpus > 1:
++            budget = os.environ.get("KEV_SPLIT_MAX_MEMORY", "36GiB")
++            load["device_map"] = "balanced"
++            load["max_memory"] = {i: budget for i in range(self.split_gpus)}
+         self.lm = AutoModel.from_pretrained(weights, **load) if weights else AutoModelForCausalLM.from_pretrained(name, revision=revision, **load).model
+         self.pad_id = pad_id(tok)
+         # hybrid backbones (Qwen3.5: Gated DeltaNet layers, recurrent) cannot honour the block-causal mask, so every
+@@ -275,7 +285,17 @@ class DecisionModel(nn.Module):
+             self.lm = get_peft_model(self.lm, cfg)
+         self.head = PointerHead(self.lm.config.hidden_size, dp=head_dim)
+         self.device = device
+-        self.to(device)
++        if self.split_gpus > 1:
++            self.head.to(device)
++            main = torch.device("cuda", torch.cuda.current_device())
++            def _hidden_to_main(module, args, output):
++                output.last_hidden_state = output.last_hidden_state.to(main)
++                return output
++            self.lm.register_forward_hook(_hidden_to_main)
++            print(f"[jev_retrieval patch] backbone split across {self.split_gpus} GPUs: "
++                  f"{sorted(set(str(d) for d in getattr(self.lm, 'hf_device_map', {}).values()))}", flush=True)
++        else:
++            self.to(device)
+ 
+     backend = "torch"           # kev.mlx_model.MLXDecisionModel is the other implementation of this scoring interface
+     graphs = None               # kev.cuda_graphs.CudaGraphs for the serving passes of a hybrid backbone on CUDA (LoadOptions.cuda_graphs)
