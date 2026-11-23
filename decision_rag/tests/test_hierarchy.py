@@ -77,13 +77,30 @@ def tiny_encoder(tmp_path):
     return str(d)
 
 
+EMBED_CHECK = """
+import sys, numpy as np
+sys.path.insert(0, sys.argv[2])
+from decision_rag import hierarchy
+enc = sys.argv[1]
+texts = ["passage: canberra", "passage: canberra is a city . the capital of australia . a city . a city",
+         "passage: stub", "passage: song"]
+x = hierarchy.embed(texts, enc, batch_size=2, max_length=64)
+assert x.shape == (4, 32) and x.dtype == np.float32, x.shape
+np.testing.assert_allclose(np.linalg.norm(x, axis=1), 1, atol=1e-5)
+# rows follow the input order despite length-sorted batching, and padding does not change a text's embedding
+for i, t in enumerate(texts):
+    np.testing.assert_allclose(hierarchy.embed([t], enc, batch_size=1, max_length=64)[0], x[i], atol=1e-5)
+print("ok")
+"""
+
+
 def test_embed_pooling_and_order(tiny_encoder):
-    texts = ["passage: canberra", "passage: canberra is a city . the capital of australia . a city . a city",
-             "passage: stub", "passage: song"]
-    x = hierarchy.embed(texts, tiny_encoder, batch_size=2, max_length=64)
-    assert x.shape == (4, 32) and x.dtype == np.float32
-    np.testing.assert_allclose(np.linalg.norm(x, axis=1), 1, atol=1e-5)
-    # rows follow the input order despite length-sorted batching, and padding does not change a text's embedding
-    for i, t in enumerate(texts):
-        np.testing.assert_allclose(hierarchy.embed([t], tiny_encoder, batch_size=1, max_length=64)[0], x[i],
-                                   atol=1e-5)
+    # Separate process: this pytest process has already started faiss's OpenMP runtime (k-means tests), and torch's
+    # own OpenMP runtime can deadlock next to it. The cluster job also runs embedding and k-means as separate processes.
+    import subprocess
+    import sys
+    from pathlib import Path
+    src = str(Path(hierarchy.__file__).resolve().parents[1])
+    r = subprocess.run([sys.executable, "-c", EMBED_CHECK, tiny_encoder, src], capture_output=True, text=True,
+                       timeout=300)
+    assert r.returncode == 0 and r.stdout.strip().endswith("ok"), r.stderr[-3000:]

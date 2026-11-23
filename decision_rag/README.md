@@ -19,7 +19,7 @@ squeue -u $USER
 
 `$DRAG_DIR` defaults to `~/scratch/decision_rag` (about 25 GB; see `env.sh`). Logs are in `logs/`.
 
-To rerun part of step 2, pass arguments through, for example `sbatch slurm/hierarchy.sub --steps describe --seeds 0`. Each step reuses the files of the steps before it.
+Step 2 runs embed, kmeans and describe as separate processes (faiss and torch can deadlock on OpenMP in one process). To rerun only some steps, set `STEPS`, for example `STEPS="describe" sbatch slurm/hierarchy.sub --seeds 0`. Each step reuses the files of the steps before it.
 
 **What to check in the logs:**
 - **`prepare`:** the corpus counts match the paper (108,626 pages, 2,682,017 paragraphs), gold is missing for 0 questions, and the example first sentences look right.

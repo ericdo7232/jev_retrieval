@@ -23,10 +23,15 @@ if __name__ == "__main__":
     steps = args.steps.split(",")
     seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else cfg["hierarchy"]["kmeans"]["seeds"]
 
-    import torch
-    print(f"torch {torch.__version__}, CUDA available {torch.cuda.is_available()}", flush=True)
-    if "describe" in steps and not torch.cuda.is_available():
-        sys.exit("No GPU visible: the description step needs one.")
+    if "kmeans" in steps and len(steps) > 1:
+        # faiss and torch each start their own OpenMP runtime; in one process they can deadlock. slurm/hierarchy.sub
+        # runs each step as its own process.
+        print("note: running kmeans in the same process as other steps; prefer one step per process", flush=True)
+    if "embed" in steps or "describe" in steps:
+        import torch
+        print(f"torch {torch.__version__}, CUDA available {torch.cuda.is_available()}", flush=True)
+        if "describe" in steps and not torch.cuda.is_available():
+            sys.exit("No GPU visible: the description step needs one.")
 
     pages = load_pages()
     if "embed" in steps or "kmeans" in steps:
