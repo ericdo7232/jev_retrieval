@@ -28,6 +28,9 @@ attention pattern, so it must match `forked` up to numerical noise.
 
 Multi-GPU: the decoder layers are split across the given devices (embeddings and the first layers on the first
 device, the last layers, final norm and readout on the last); hidden states move between devices between layers.
+
+FP8 (fp8=True, Ada/Hopper only): the large projections run as FP8 matrix multiplies (fp8.py). The model then fits on
+one 48 GB GPU, so each GPU can run its own copy on its own share of the queries instead of splitting one copy.
 """
 from __future__ import annotations
 
@@ -208,7 +211,10 @@ class Scorer:
     """Loads the checkpoint (or takes a built backbone and readout, for tests) and scores yes/no questions."""
 
     def __init__(self, checkpoint, *, devices=None, backbone=None, readout=None, backend="auto", budget=16384,
-                 joint_max_length=32768, dtype=torch.bfloat16):
+                 joint_max_length=32768, dtype=torch.bfloat16, fp8=False, fp8_min_features=256, mlp_chunk=8192):
+        """fp8: quantize the large projections to FP8 as each layer is placed (needs Ada/Hopper; see fp8.py).
+        With fp8 the 27B model fits on one 48 GB GPU. mlp_chunk: tokens per MLP call (bounds peak memory on long
+        states; per-token, so results do not change)."""
         checkpoint = Path(checkpoint)
         import_package(checkpoint)
         from transformers import AutoProcessor
@@ -248,6 +254,8 @@ class Scorer:
         self.kernels = Kernels(backend)
         self.budget = budget
         self.joint_max_length = joint_max_length
+        self.mlp_chunk = mlp_chunk
+        self.fp8, self.fp8_min_features, self.fp8_mode, self.fp8_layers = fp8, fp8_min_features, None, 0
         if devices is None:
             n = torch.cuda.device_count()
             devices = [f"cuda:{i}" for i in range(n)] if n else ["cpu"]
@@ -265,11 +273,29 @@ class Scorer:
             counts[-1] += 1
         self.layer_devices = [d for d, c in zip(devices, counts) for _ in range(c)]
         self.devices, self.first, self.last = devices, devices[0], devices[-1]
-        self.backbone.visual.to(self.first)
+        if self.fp8:
+            try:
+                from . import fp8
+            except ImportError:  # run as a script from pplx/ (smoke.py), not as a package
+                import fp8
+            modes = {fp8.supported(d) for d in devices}
+            if None in modes:
+                raise ValueError(f"FP8 needs torch._scaled_mm on every device {[str(d) for d in devices]} "
+                                 "(an Ada, Hopper or newer GPU; the A6000 is Ampere and has no FP8 tensor cores)")
+            self.fp8_mode = "rowwise_emulated" if "rowwise_emulated" in modes else "rowwise"
+            if self.fp8_mode == "rowwise_emulated":
+                self.kernels.notes.append("FP8: no rowwise _scaled_mm kernel for this GPU in this torch build; "
+                                          "per-token scales applied after a per-tensor kernel (slightly slower)")
+        else:  # text-only scoring never runs the vision encoder; with fp8 it stays on the CPU to save GPU memory
+            self.backbone.visual.to(self.first)
         self.lm.embed_tokens.to(self.first)
         self.lm.rotary_emb.to(self.first)
         for layer, d in zip(self.layers, self.layer_devices):
-            layer.to(d)
+            layer.to(d)  # one bf16 layer at a time on the GPU, then quantized: the bf16 model never has to fit
+            if self.fp8:
+                self.fp8_layers += fp8.quantize(layer, self.fp8_mode, self.fp8_min_features)
+        if self.fp8 and any(d.type == "cuda" for d in devices):
+            torch.cuda.empty_cache()
         self.lm.norm.to(self.last)
         self.readout.to(self.last)
         if len(set(devices)) > 1:  # the official (Transformers) forward needs its inputs moved between devices
@@ -409,7 +435,9 @@ class Scorer:
                 else:
                     x, got = self._full(layer.self_attn, x, c, s, pack, p, capture)
                 h = h + x
-                h = h + layer.mlp(layer.post_attention_layernorm(h))
+                for s in range(0, h.shape[1], self.mlp_chunk):  # per-token, so chunking changes nothing
+                    part = h[:, s:s + self.mlp_chunk]
+                    part += layer.mlp(layer.post_attention_layernorm(part))
             cache.append(got)
         return self.lm.norm(h.to(self.last)), (cache if capture else None)
 

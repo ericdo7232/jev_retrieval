@@ -45,7 +45,22 @@ Logs: `logs/pplx-setup-<job>.out` and `logs/pplx-smoke-<job>.out`. Results go to
 | `smoke` | P(refund) > 0.5 > P(late delivery) on an obvious customer message |
 | `needle` | Gold page in the top 5 of 200 titles for at least 5 of the 6 queries |
 | `isolation` | Re-asking 29 questions in another subset and order changes P(yes) by less than 0.02 |
-| `timing` | Information only: seconds, tokens/s and peak memory on stage-sized workloads, and an estimate per DecisionRAG query |
+| `timing` | Information only: seconds, tokens/s and peak memory on stage-sized workloads (each run twice; the second, without kernel compilation, is used), and an estimate per DecisionRAG query |
+| `reference` | Only with `--reference old.json`: answers on the same workloads agree with an earlier run (e.g. FP8 against bf16): mean \|Δp\| < 0.02, max < 0.15, needle gold ranks unchanged |
+
+## FP8 on one RTX 6000 Ada (`--fp8`, `pplx/fp8.py`)
+
+The 2 × A6000 bf16 run measured about 1,000–1,400 tokens/s, roughly 15 minutes per DecisionRAG question. The A6000 (Ampere) has no FP8 tensor cores; the RTX 6000 Ada does. With `--fp8`:
+
+- The large projections (attention, Gated DeltaNet in/out, MLP) run as FP8 matrix multiplies: weights quantized at load with one scale per output channel, activations at run time with one scale per token. Everything else (norms, convolutions, the recurrent and attention kernels, embeddings, readout) stays bf16.
+- Scales are per token, not per tensor, so a question's answer does not depend on the other questions packed with it (a per-tensor scale would break forked scoring's isolation).
+- The model is about 27 GB and fits on one 48 GB card, so each GPU runs its own copy on its own share of the questions instead of two GPUs sharing one copy.
+
+```bash
+sbatch slurm/pplx-smoke-ada.sub --reference results/pplx_smoke_<bf16 run>.json
+```
+
+`default_partition` is preemptible; resubmit if the job is preempted. CPU tests of the FP8 layer and the scorer paths: `PPLX_TEST_CKPT=<dir with the checkpoint's small files> python -m pytest -q tests`.
 
 ## If something fails
 
@@ -62,11 +77,14 @@ Logs: `logs/pplx-setup-<job>.out` and `logs/pplx-smoke-<job>.out`. Results go to
 ```
 env.sh                  paths (WORK_DIR, PPLX_CKPT)
 common.py               workloads (stage-shaped, needle questions)
-pplx/scorer.py          forked / exact / joint scoring, layers split across GPUs
+pplx/scorer.py          forked / exact / joint scoring, layers split across GPUs, optional FP8
+pplx/fp8.py             FP8 linear layers (per-channel weights, per-token activations)
 pplx/smoke.py           cluster smoke test
+tests/test_fp8.py       CPU tests: FP8 layer, FP8 and chunked-MLP scorer paths
 pplx/setup.sh           environment + checkpoint download
 slurm/setup.sub         runs pplx/setup.sh (CPU job)
-slurm/pplx-smoke.sub    smoke test on 2 x A6000
+slurm/pplx-smoke.sub    smoke test on 2 x A6000 (bf16)
+slurm/pplx-smoke-ada.sub  smoke test on 1 x RTX 6000 Ada (FP8), compared with a bf16 run
 results/, logs/         outputs (results are committed, logs are not)
 ```
 
