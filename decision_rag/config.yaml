@@ -1,0 +1,39 @@
+# Every setting the paper leaves open is fixed here (see IMPLEMENTATION.md, "Gaps and decisions").
+# Large outputs go under $DRAG_DIR (default ~/scratch/decision_rag); see env.sh.
+
+data:
+  hf_repo: UKPLab/dapr            # DAPR, Natural Questions subset
+  subset: NaturalQuestions
+  expected_pages: 108626          # paper: 108,626 pages and 2,682,017 paragraphs
+  expected_paragraphs: 2682017
+  test_sample:                    # 500 of the 3,610 test questions; IDs written to splits/nq_test500.txt
+    size: 500
+    seed: 0
+
+hierarchy:
+  first_sentence:
+    min_words: 4                  # skip shorter first sentences (captions, fragments) and use the next paragraph's
+    max_words: 100                # cap for a run-on "sentence"
+    paragraphs_to_try: 3
+  embed:
+    model: intfloat/e5-base-v2
+    prefix: "passage: "           # e5 needs the passage prefix; text is "{title}. {first sentence}"
+    max_length: 512
+    batch_size: 256
+  kmeans:
+    k: 1000
+    niter: 25
+    nredo: 5                      # restarts; the run with the best objective is kept
+    spherical: true               # unit-norm centroids: cosine clustering on L2-normalized embeddings
+    seeds: [0, 1, 2]              # three trees, to measure how much the random clustering moves results
+  typical_titles: 300             # titles per description prompt, most similar to the centroid first
+
+describe:
+  model: Qwen/Qwen3-8B
+  backend: vllm                   # vllm, or transformers (slower fallback, used automatically if vllm fails)
+  max_new_tokens: 80
+  max_words: 30
+  prompt: |-
+    Below are titles of Wikipedia pages that belong to one group, most typical first. Write one sentence of at most 30 words describing the main kinds of subjects in this group, including less typical ones. Output only the sentence.
+
+    {titles}

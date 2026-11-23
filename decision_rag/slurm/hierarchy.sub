@@ -1,0 +1,20 @@
+#!/bin/bash
+# Step 2 (one A6000): e5 page embeddings, k-means trees for seeds 0/1/2, Qwen3-8B cluster descriptions.
+# Submit from decision_rag/ after slurm/prepare.sub:   sbatch slurm/hierarchy.sub
+# Extra arguments go to scripts/build_hierarchy.py, e.g.  sbatch slurm/hierarchy.sub --steps describe --seeds 0
+#SBATCH --job-name=drag-hierarchy
+#SBATCH --partition=lil-interns
+#SBATCH --gres=gpu:nvidia_rtx_a6000:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/%x-%j.out
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
+source ./env.sh
+mkdir -p logs
+# torch and faiss may each bring an OpenMP runtime; allow both in one process instead of aborting.
+export KMP_DUPLICATE_LIB_OK=TRUE
+echo "Node $(hostname)"
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+"$DRAG_DIR/.venv/bin/python" scripts/build_hierarchy.py "$@"

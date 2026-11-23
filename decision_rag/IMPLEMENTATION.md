@@ -5,7 +5,7 @@ Implementation plan for rebuilding DecisionRAG ([Wan, Jünger, Du et al., 2026](
 ## Scope
 
 - **Dataset:** Natural Questions, DAPR version. This is the only benchmark where DecisionRAG builds its own hierarchy. ConditionalQA and MTRAG come later.
-- **Decision model:** GLiDE 27B, self-hosted with vLLM on our GPU. The Jev API (1.13) is not used for now.
+- **Decision model:** pplx-decider-v1.2 (27B), self-hosted on two A6000s with forked scoring (see `../decision_models/README.md`), as a stand-in until the Jev API (1.13) can be used. GLiDE 27B, Kev-27B and JEV-27B were considered first and dropped.
 - **Cluster descriptions:** Qwen3-8B, self-hosted on our GPU.
 - **Authors' code and artifacts:** not used. Everything is rebuilt from the paper, and every unstated detail is decided below and recorded in config.
 
@@ -61,7 +61,7 @@ These details are not given in the paper. Each is set in `config.yaml` so it can
 
 | Gap | Decision | Why |
 |---|---|---|
-| Which 500 of the 3,610 test questions | Uniform random sample, seed 0; the IDs are saved to `data/nq_test500.txt` and committed | The paper's sample is not released; a fixed, committed list makes our runs repeatable |
+| Which 500 of the 3,610 test questions | Uniform random sample (`random.Random(0).sample` of the sorted IDs), saved in sampled order to `splits/nq_test500.txt` and committed; "the first 100" means its first 100 lines | The paper's sample is not released; a fixed, committed list makes our runs repeatable |
 | How R@10 is computed with several gold paragraphs | Fraction of gold paragraphs in the top 10, averaged over questions (DAPR/BEIR convention). Hit@10 (any gold in the top 10) is also reported | The standard convention; reporting both covers the other reading |
 | Hit@1 and nDCG@10 | Hit@1: the top paragraph is gold. nDCG@10: binary relevance, computed with `pytrec_eval` | Standard definitions |
 
@@ -69,9 +69,10 @@ These details are not given in the paper. Each is set in `config.yaml` so it can
 
 | Gap | Decision | Why |
 |---|---|---|
-| How the "first sentence" is extracted | First sentence of the page's first paragraph, split with `pysbd`; if the paragraph is empty, the next non-empty one is used | A robust default for Wikipedia text |
+| How the "first sentence" is extracted | Citation markers like `[1]` removed, then the first sentence (`pysbd`) of the page's first paragraph. If it has fewer than 4 words (captions, fragments), the next of the first 3 paragraphs is tried; capped at 100 words | A robust default for Wikipedia text; about 7% of first paragraphs are under 8 words |
 | Input format for e5 | `passage: {title}. {first sentence}`, embeddings L2-normalized | e5 requires the `passage: ` prefix; normalizing makes k-means behave like cosine clustering |
-| k-means settings | faiss k-means, k = 1,000, spherical, 25 iterations, 5 restarts, seed 0 | Fast and deterministic. We build seeds 0, 1 and 2 to measure how much the random clustering moves results |
+| k-means settings | faiss k-means, k = 1,000, spherical, 25 iterations, 5 restarts, no subsampling | Fast and deterministic. We build seeds 0, 1 and 2 to measure how much the random clustering moves results |
+| e5 pooling | Mean pooling over tokens (e5's own), fp16 on GPU, max 512 tokens | e5's documented usage |
 | What "most typical" titles means | Titles sorted by cosine similarity to the cluster centroid, highest first; at most 300 | The natural reading of "most typical" for k-means |
 | Exact Qwen prompt and generation settings | A prompt written from the paper's description (below), greedy decoding, thinking off, output cut at 30 words | The paper's prompt is not released; greedy decoding makes the descriptions repeatable |
 
