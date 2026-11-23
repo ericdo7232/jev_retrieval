@@ -17,5 +17,6 @@ PY="$WORK_DIR/pplx/.venv/bin/python"
 echo "Node $(hostname)"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 "$PY" -c "import torch; print('torch', torch.__version__, 'CUDA', torch.version.cuda, 'available', torch.cuda.is_available(), 'GPUs', torch.cuda.device_count())"
+source slurm/triton_tools.sh
 
 "$PY" pplx/smoke.py --checkpoint "$PPLX_CKPT" --out results
