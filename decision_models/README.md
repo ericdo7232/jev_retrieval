@@ -1,125 +1,73 @@
-# Decision-model tests: Kev-27B and JEV-27B
+# Decision model for DecisionRAG: pplx-decider-v1.2 with forked scoring
 
-DecisionRAG scores every candidate at a navigation stage with yes/no questions in one shared context. That is cheap with Jev, because the context is read once. We can't use Jev for now, and GLiDE-27B rereads the whole context for every question, so we are choosing between two open models:
+DecisionRAG asks a yes/no question about every candidate (cluster, page, paragraph) in one shared context. Jev reads the context once and answers every question independently. We can't use Jev yet, so we use [`perplexity-ai/pplx-decider-v1.2`](https://huggingface.co/perplexity-ai/pplx-decider-v1.2) as a stand-in. It is a 27B Qwen3.5 model and the public checkpoint needs no token.
 
-| Model | Why it is a candidate | What could go wrong |
-|---|---|---|
-| **Kev-27B** (`jaredpalmer/kev-27b`) | Reads the context once and answers any number of isolated yes/no questions on it in one request. Decision Index close to Jev's (59.6 vs 60.2) | Memory: its card reports 78.7 GB peak at a 32k-token context, and our largest stage is about 40k tokens |
-| **JEV-27B** (`autotrust/JEV-27B`) | Distilled from Jev 1.13, the version DecisionRAG used; vendor reports KL 0.017 and 90.5% top-choice agreement with Jev | One question per request. Cheap only if vLLM's prefix caching reuses the shared context across requests, which is unproven for this hybrid architecture |
+## The problem with the model's normal (joint) mode
 
-These tests answer the questions that decide between them, on the same GPU and identical inputs.
+The model puts the state and all the questions in one sequence, with one readout per question. Its 16 full-attention layers are noncausal, so every question sees every other question. Answers then depend on which other candidates are in the request: the model card measures −2.9 to −4.8 points when competing candidates are grouped. DecisionRAG merges P(yes) across requests and multiplies page by paragraph scores, so it needs scores that don't depend on the rest of the request.
 
-## What the tests measure
+## Forked scoring (`pplx/scorer.py`)
 
-| Test | What it does | What to look for |
-|---|---|---|
-| `smoke` | Two obvious questions on a short text; prints a raw response | P(yes) high for "refund", low for "late delivery". Confirms the request format works |
-| `needle` | 6 real questions; the gold Wikipedia page and 5 related pages are hidden among 200 page titles; every page gets a yes/no question | Gold page ranked first in most of the 6. Also gives both models' full rankings on identical inputs for `compare.py` |
-| `position` | Gold page placed at position 1, 625 and 1,250 of 1,250 titles | Similar P(yes) at every position. A big drop at some position means position bias |
-| `consistency` | Repeats a 50-question request. Kev: compares one joint request with one-question-at-a-time (`/separate`) and with shuffled question order. JEV-27B: compares concurrent with sequential requests | Differences near 0. Kev's questions should not affect each other; JEV-27B's answers should not depend on batching |
-| `scale` | Stage-shaped workloads (table below); time, tokens, peak GPU memory. JEV-27B also times a cold first request against a warm second request on the same context | Kev: time per stage, and whether `stage3_230` fits in memory. JEV-27B: warm request much faster than cold means prefix caching works |
+The state is computed once and cached. Each question then runs as its own branch that attends to the cached state and to itself only, at the positions and with the tokens it has in a request of its own:
+- **Gated DeltaNet layers:** each branch starts from the state's final recurrent state and convolution window.
+- **Full-attention layers:** each branch attends to the state's cached keys and values plus its own; the two parts are merged by their log-sum-exp.
+- **Cost:** the same as joint mode, about 50 tokens per question on top of the state.
 
-Scale workloads (synthetic text sized like DecisionRAG's stages on Natural Questions):
+**The one approximation:** sent alone, a question is also seen by the state's tokens in the full-attention layers. Here the state is encoded once without seeing any question. The query is in the state, so the state still knows what is being asked; it just doesn't know which candidate each question is about.
 
-| Workload | Context | Questions | Paper's equivalent |
-|---|---|---|---|
-| `stage1_125` | 125 cluster descriptions, ~5k tokens | 125 | One of the 8 cluster requests |
-| `stage2_625`, `stage2_1250`, `stage2_2500` | Page titles grouped under clusters, ~5k / ~10k / ~20k tokens | 625 / 1,250 / 2,500 | Page requests of up to 20k tokens |
-| `stage3_115`, `stage3_230` | Paragraphs grouped under pages, ~20k / ~40k tokens | 115 / 230 | The one paragraph request (~230 paragraphs) |
+Checked on CPU against the unmodified Transformers model, using a tiny random model with the same architecture, in float32:
+- forked matches Transformers run with the same attention pattern (max difference 5e-6);
+- forked answers don't change when other questions are added, removed or reordered (5e-7);
+- joint answers do change (0.23).
 
-The text in `scale` is synthetic, so it tests speed and memory only. `needle` and `position` use real questions and page titles, but they are a sanity check, not a retrieval evaluation.
+The scorer also has `exact` (each question alone, the state recomputed every time), `joint`, and `official` / `official_masked` (the Transformers model, for checking).
+
+**GPUs:** the weights are about 52 GB in bf16, so the 64 layers are split across two A6000s: 31 on the first GPU with the embeddings, 33 on the second. The A6000 doesn't support FP8, so there is no quantization, and answers match the model card's bf16 numbers.
 
 ## Running on the cluster (Unicorn, partition `lil-interns`)
 
-Requirements: at least 80 GB of GPU memory in total (two A6000s here), about 120 GB of disk for weights and environments, `git`, and [`uv`](https://docs.astral.sh/uv/).
+From `decision_models/` on the cluster, after `git pull`:
 
-**GPUs.** Both models are 27B parameters in bf16 (51–55 GB of weights), so a single A6000 (48 GB) is too small.
+```bash
+SETUP=$(sbatch --parsable slurm/setup.sub)                                          # install + download (~52 GB), CPU only
+sbatch --dependency=afterok:$SETUP --kill-on-invalid-dep=yes slurm/pplx-smoke.sub   # smoke test on 2 x A6000
+squeue -u $USER
+```
 
-All jobs run on partition `lil-interns`. Both models need more memory than one 48 GB A6000, so each test uses two.
+Logs: `logs/pplx-setup-<job>.out` and `logs/pplx-smoke-<job>.out`. Results go to `results/pplx_smoke_<time>.json`.
 
-| Job | GPU | How the model is split |
-|---|---|---|
-| `slurm/setup.sub` | None | Installs and downloads as a job, so nothing heavy runs on the login node |
-| `slurm/kev.sub` | Two A6000s | Kev's server supports one GPU only, so `kev/setup.sh` applies `kev/split-gpus.patch` (below), which puts different layers on each GPU |
-| `slurm/jev27b.sub` | Two A6000s | vLLM's tensor parallelism |
+## What the smoke test checks (`pplx/smoke.py`)
 
-**`kev/split-gpus.patch`.** Kev's loader moves the whole model onto one GPU. The patch (23 lines in `kev/model.py` and `kev/checkpoint.py`, against Kev commit `65b1e76`) adds `KEV_SPLIT_GPUS=N`:
-- The layers are spread across N GPUs with transformers' `device_map="balanced"`.
-- The scoring head stays on the first GPU, and the backbone's output is brought back to it.
-- Each layer's KV and DeltaNet caches stay on that layer's GPU.
+| Step | Pass if |
+|---|---|
+| `load` | Model loads and is split across both GPUs (prints weights per GPU) |
+| `kernels` | Forked scoring with the GPU kernels (flash-linear-attention, varlen FlashAttention) agrees with the Transformers model run with the same attention pattern: mean \|Δp\| < 0.01, max < 0.05 |
+| `smoke` | P(refund) > 0.5 > P(late delivery) on an obvious customer message |
+| `needle` | Gold page in the top 5 of 200 titles for at least 5 of the 6 queries |
+| `isolation` | Re-asking 29 questions in another subset and order changes P(yes) by less than 0.02 |
+| `timing` | Information only: seconds, tokens/s and peak memory on stage-sized workloads, and an estimate per DecisionRAG query |
 
-`kev/serve.sh` turns it on when the job has more than one GPU, along with `KEV_CUDA_GRAPHS=0` and `KEV_FUSED=0`, because Kev's CUDA graphs and fused kernels assume a single GPU. The model and its answers are unchanged. It is slower than Kev on one 80 GB GPU, so treat Kev's timings here as a lower bound.
+## If something fails
 
-1. **Get the code.** Push from the laptop, then on the cluster clone or pull the repo and `cd` into `decision_models/`.
-2. **Optional: edit `env.sh`.** By default everything goes under `~/scratch/decision_models` (about 120 GB). The settings apply only to scripts in this folder.
-3. **Install and download**, once:
-   ```bash
-   sbatch slurm/setup.sub
-   ```
-   It runs `kev/setup.sh` and `jev27b/setup.sh`. The JEV-27B part ends with a check that the installed vLLM has what JEV-27B's server needs. JEV-27B was tested on an unreleased September 2026 vLLM build, so if the check fails, rerun just that part with a nightly build:
-   ```bash
-   sbatch --wrap 'VLLM_SPEC="vllm --pre --extra-index-url https://wheels.vllm.ai/nightly" bash jev27b/setup.sh' \
-     --partition=lil-interns --cpus-per-task=8 --mem=32G --time=02:00:00 --output=logs/jev27b-setup-%j.out
-   ```
-4. **Run the tests:**
-   ```bash
-   sbatch slurm/kev.sub      # ~30 min including model load
-   sbatch slurm/jev27b.sub   # two server starts (with and without prefix caching), 1-3 h
-   ```
-   Each job starts the server, waits for it, runs `bench.py`, and stops the server. Server output goes to `logs/`.
-6. **Compare:**
-   ```bash
-   python3 compare.py results/kev_default_*.json results/jev27b_prefix_on_*.json
-   python3 compare.py results/jev27b_prefix_on_*.json results/jev27b_prefix_off_*.json
-   ```
-7. **Commit and push `results/`** (and the server logs if something failed) so the results can be analyzed.
-
-## Reading the results
-
-**Kev-27B is usable for DecisionRAG if:**
-- `smoke` passes and `needle` ranks the gold page first in most queries.
-- `consistency` shows near-zero differences, so batching questions doesn't change answers.
-- `stage2_2500` takes a few seconds or less. The paper's whole query takes 1.7 s with Jev, with stage 2 split into parallel requests.
-- `stage3_230` runs without an out-of-memory error. If it fails, the paragraph stage needs two smaller requests, or a GPU with more memory.
-
-**JEV-27B is usable if:**
-- `smoke` and `needle` pass as above.
-- With prefix caching on, `warm_over_cold` is well below 1 (for example under 0.2) for the large workloads. With it off, it should be near 1. The `prefix_cache_metrics_delta` hit counters, if vLLM exposes them, confirm the same thing.
-- `est_full_s` for `stage2_2500` with caching on is in the same range as Kev's.
-
-**Between the two:**
-- If both are usable, `compare.py` shows how far their rankings agree on the `needle` queries.
-- JEV-27B is the closer imitation of Jev, so it wins if it is fast enough.
-- If its prefix caching doesn't work, Kev is the choice.
-
-## Known uncertainties
-
-- **JEV-27B's vLLM version** is not published. `jev27b/setup.sh` checks compatibility and suggests a nightly build if needed.
-- **`--trust-request-chat-template`**: JEV-27B's server script asks for this flag in its docstring, but its README command leaves it out. If the server rejects requests, rerun with `TRUST_REQUEST_CHAT_TEMPLATE=1` set in the environment.
-- **`thinking: "off"`** is sent with JEV-27B requests so that no reasoning is generated. If the server rejects the field, set `JEV_THINKING=""`.
-- **Kev's fused kernels** need `flash-linear-attention` at the version pinned in Kev's source. `kev/setup.sh` reads and installs it. Without it the server still runs, but slower.
-- **Kev split across GPUs is untested.** The patch was checked against the code paths Kev-27B's serving uses, in the transformers and accelerate versions Kev pins (5.17.0, 1.15.0), but has not run on a GPU yet. The server log prints `[jev_retrieval patch] backbone split across 2 GPUs: [...]` at startup. If it fails, `logs/kev-server-*.log` will show where.
-  - **Most likely failure:** a Triton kernel from flash-linear-attention launched on the wrong GPU. To rule that out, uninstall it from Kev's environment and rerun (slower, same answers): `uv pip uninstall --python $WORK_DIR/kev/.venv/bin/python flash-linear-attention`.
-  - **Memory:** `KEV_SPLIT_MAX_MEMORY` (default 36GiB per GPU) caps how much of each GPU the weights may take. The weights need about 26 GB per GPU, so the default leaves room for activations.
-- **GPU memory** comes from `nvidia-smi`. vLLM reserves most of the GPU at startup, so JEV-27B's memory numbers are not informative. Kev's are.
+- **`CUDA available False`** in the log: the PyPI torch build needs a newer NVIDIA driver than the node has. Reinstall with an older CUDA build:
+  ```bash
+  sbatch --wrap 'TORCH_INDEX=https://download.pytorch.org/whl/cu126 bash pplx/setup.sh' --partition=lil-interns --cpus-per-task=8 --mem=32G --time=01:00:00 --output=logs/pplx-setup-%j.out
+  ```
+- **`kernels` fails but the other steps pass:** a GPU kernel disagrees with Transformers. Paste the log.
+- **"varlen attention returns log-sum-exp: no"** in the setup log: forked scoring still works, but attention over the shared state runs in plain PyTorch (slower).
+- **Out of memory:** lower `--budget` (tokens per forward pass, default 16384) in `slurm/pplx-smoke.sub`.
 
 ## Files
 
 ```
-env.sh               paths and ports (edit this)
-bench.py             runs the tests against a running server; writes results/<model>_<tag>_<time>.json
-compare.py           side-by-side comparison of two result files
-clients.py           HTTP clients: Kev /v1/systemone, JEV-27B /v1/decide
-common.py            workloads, needle questions, GPU monitor, HTTP helpers
-kev/setup.sh         clone Kev at a pinned commit, apply split-gpus.patch, install, download weights
-kev/split-gpus.patch lets Kev's server split the model across several GPUs (KEV_SPLIT_GPUS)
-kev/serve.sh         start Kev's server (split across GPUs when the job has more than one)
-jev27b/setup.sh      install vLLM, download weights, check compatibility
-jev27b/serve.sh      start JEV-27B's server (PREFIX_CACHING=1 or 0)
-slurm/setup.sub      one-time install and download (CPU job)
-slurm/kev.sub        Kev-27B test job
-slurm/jev27b.sub     JEV-27B test job (with and without prefix caching)
-results/, logs/      outputs (results are committed, logs are not)
+env.sh                  paths (WORK_DIR, PPLX_CKPT)
+common.py               workloads (stage-shaped, needle questions)
+pplx/scorer.py          forked / exact / joint scoring, layers split across GPUs
+pplx/smoke.py           cluster smoke test
+pplx/setup.sh           environment + checkpoint download
+slurm/setup.sub         runs pplx/setup.sh (CPU job)
+slurm/pplx-smoke.sub    smoke test on 2 x A6000
+results/, logs/         outputs (results are committed, logs are not)
 ```
 
-`bench.py` and `compare.py` use only the Python standard library.
+**Earlier attempt, not used:** `kev/`, `jev27b/`, `bench.py`, `clients.py`, `compare.py`, `slurm/kev.sub` and `slurm/jev27b.sub` tested Kev-27B and JEV-27B, and both failed to run. They can be deleted.

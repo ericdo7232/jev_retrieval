@@ -7,6 +7,9 @@ export WORK_DIR="${WORK_DIR:-$HOME/scratch/decision_models}"
 # Hugging Face cache (Kev-27B weights are downloaded here).
 export HF_HOME="${HF_HOME:-$WORK_DIR/hf_cache}"
 
+# pplx-decider-v1.2 checkpoint (~52 GB; pplx/setup.sh downloads it here).
+export PPLX_CKPT="${PPLX_CKPT:-$WORK_DIR/pplx/pplx-decider-v1.2}"
+
 export KEV_PORT="${KEV_PORT:-8008}"
 export JEV_PORT="${JEV_PORT:-8000}"
 
